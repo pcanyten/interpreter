@@ -172,9 +172,12 @@
   </section>
 
   <div class="bar" id="bar">
-    <span class="pair" title="v3"><span id="pairMe">KO</span><span class="arrow">⇄</span><span id="pairThem">JA</span><span class="arrow">v3</span></span>
+    <span class="pair" title="v3"><span id="pairMe">KO</span><span class="arrow">⇄</span><span id="pairThem">JA</span><span class="arrow">v4</span></span>
     <select id="modelQuick" aria-label="번역 모델"></select>
     <span class="status" id="status"></span>
+    <button type="button" class="bar-btn" id="resetChat" aria-label="대화 초기화">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+    </button>
     <button type="button" class="bar-btn" id="openSettings" aria-label="설정">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
     </button>
@@ -233,6 +236,11 @@
     <button type="button" class="switch" id="autoSpeak" role="switch" aria-checked="true" aria-label="번역 자동 읽어주기"></button>
   </div>
 
+  <div class="toggle">
+    <span><span class="t">대화 모드 (마이크 자동 교대)</span><br><span class="d">내 말이 번역되어 읽히면 마이크가 상대 쪽으로 넘어가고, 상대가 말하면 다시 내 쪽으로 돌아옵니다.</span></span>
+    <button type="button" class="switch" id="autoTurn" role="switch" aria-checked="true" aria-label="대화 모드"></button>
+  </div>
+
   <p class="fine" id="srSupport"></p>
 
   <div class="sheet-actions">
@@ -282,7 +290,7 @@
   const modelOf = (id) => MODELS.find((m) => m.id === id) || MODELS[0];
 
   // ---- state ----
-  const S = { me: 'ko', them: 'ja', model: 'claude-haiku-5-5', key: '', autoSpeak: true };
+  const S = { me: 'ko', them: 'ja', model: 'claude-haiku-5-5', key: '', autoSpeak: true, autoTurn: true };
   try {
     const saved = JSON.parse(localStorage.getItem('pi.voice.settings') || 'null');
     if (saved) {
@@ -291,6 +299,7 @@
       if (saved.model && MODELS.some((m) => m.id === saved.model)) S.model = saved.model;
       if (typeof saved.key === 'string') S.key = saved.key;
       if (typeof saved.autoSpeak === 'boolean') S.autoSpeak = saved.autoSpeak;
+      if (typeof saved.autoTurn === 'boolean') S.autoTurn = saved.autoTurn;
     }
   } catch (e) { /* storage unavailable */ }
   function saveSettings() { try { localStorage.setItem('pi.voice.settings', JSON.stringify(S)); } catch (e) { /* ignore */ } }
@@ -381,7 +390,7 @@
       setStatus(`${m.applied} · ${(m.ms / 1000).toFixed(1)}s`);
       if (m.finalizeOnDone) { m.finalizeOnDone = false; finishLive(m); }
       else if (opts.onDone) opts.onDone();
-      else if (opts.speak !== false && m.dst && S.autoSpeak && !m.spoken) { m.spoken = true; speak(m.dst, m.dstLang); }
+      else if (opts.speak !== false && m.dst && S.autoSpeak && !m.spoken) { m.spoken = true; speak(m.dst, m.dstLang, () => { if (S.autoTurn && listening === m.by) startListening(m.by === 'me' ? 'them' : 'me'); }); }
     } catch (e) {
       if (e && e.name === 'AbortError') return;
       m.status = 'error'; m.err = copyFor(e);
@@ -420,6 +429,7 @@
   // translation streams after a short pause, and the bubble is committed when the utterance ends.
   let live = null;            // { owner, m, lastTranslated, timer }
   const PARTIAL_DELAY = 700;  // ms of no new words before a partial translation is requested
+  const SEGMENT_SILENCE = 1300; // ms of no new words before the utterance is committed (iOS never marks final on its own)
   const IS_WEBKIT = /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Safari/.test(navigator.userAgent) && !/Chrome|CriOS|Android/.test(navigator.userAgent));
 
   function ensureLive(owner) {
@@ -441,9 +451,13 @@
     const L = ensureLive(owner);
     const m = L.m;
     if (transcript && transcript !== m.src) { m.src = transcript; renderAll(); }
-    clearTimeout(L.timer);
+    clearTimeout(L.timer); clearTimeout(L.commitTimer);
     if (isFinal) { commitLive(); return; }
     L.timer = setTimeout(() => translateLive(L, false), PARTIAL_DELAY);
+    L.commitTimer = setTimeout(() => {
+      // Silence: end this recognition session so the utterance is committed; onend restarts the mic.
+      if (rec) { try { rec.stop(); } catch (e) { commitLive(); } } else commitLive();
+    }, SEGMENT_SILENCE);
   }
   function translateLive(L, final) {
     const m = L.m;
@@ -457,13 +471,16 @@
   }
   function finishLive(m) {
     m.live = false;
-    if (m.status === 'done' && m.dst && S.autoSpeak && !m.spoken) { m.spoken = true; speak(m.dst, m.dstLang); }
+    const other = m.by === 'me' ? 'them' : 'me';
+    const handOver = () => { if (S.autoTurn && listening === m.by) startListening(other); };
+    if (m.status === 'done' && m.dst && S.autoSpeak && !m.spoken) { m.spoken = true; speak(m.dst, m.dstLang, handOver); }
+    else if (m.status === 'done') handOver();
     renderAll();
   }
   function commitLive() {
     if (!live) return;
     const L = live; live = null;
-    clearTimeout(L.timer);
+    clearTimeout(L.timer); clearTimeout(L.commitTimer);
     const m = L.m;
     if (!m.src) { const i = messages.indexOf(m); if (i >= 0) messages.splice(i, 1); renderAll(); return; }
     if (m.src === L.lastTranslated && m.status === 'done') { finishLive(m); return; }
@@ -561,15 +578,15 @@
       micButton(o).setAttribute('aria-pressed', String(on));
       const h = hintOf(o);
       const other = langOf(o === 'me' ? S.them : S.me).code;
-      if (on) { h.textContent = speaking ? '▶ ' : '● REC'; h.classList.add('live'); }
+      if (on) { h.textContent = speaking ? '▶' : '● REC'; h.classList.add('live'); }
       else { h.textContent = `→ ${other}`; h.classList.remove('live'); }
     }
   }
 
   // ---- speech synthesis ----
-  function speak(text, code) {
+  function speak(text, code, onDone) {
     try {
-      if (!('speechSynthesis' in window) || !text) return;
+      if (!('speechSynthesis' in window) || !text) { if (onDone) onDone(); return; }
       window.speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
       const tts = langOf(code).tts;
@@ -584,10 +601,12 @@
         if (rec) { const r = rec; rec = null; try { r.onend = null; r.stop(); } catch (e) { /* ignore */ } }
         updateMicUI();
       };
+      let doneCalled = false;
       const resumeMic = () => {
         if (!speaking) return;
         speaking = false;
-        if (listening && listening === wasListening) { clearTimeout(restartTimer); restartTimer = setTimeout(spinUp, 300); }
+        if (onDone && !doneCalled) { doneCalled = true; onDone(); }
+        if (listening && !rec) { clearTimeout(restartTimer); restartTimer = setTimeout(spinUp, 300); }
         updateMicUI();
       };
       u.onstart = pauseMic;
@@ -597,7 +616,7 @@
       window.speechSynthesis.speak(u);
       // Safety: some browsers never fire onend for cancelled utterances.
       setTimeout(() => { if (speaking && !window.speechSynthesis.speaking) resumeMic(); }, Math.min(30000, 1500 + text.length * 120));
-    } catch (e) { speaking = false; }
+    } catch (e) { speaking = false; if (onDone) onDone(); }
   }
 
   // ---- render ----
@@ -650,6 +669,7 @@
     $('selMe').value = S.me; $('selThem').value = S.them;
     $('apiKey').value = S.key;
     $('autoSpeak').setAttribute('aria-checked', String(S.autoSpeak));
+    $('autoTurn').setAttribute('aria-checked', String(S.autoTurn));
     for (const el of $('models').querySelectorAll('.model')) el.setAttribute('aria-checked', String(el.dataset.model === S.model));
     $('openSettings').classList.toggle('attn', !S.key);
     updateMicUI();
@@ -708,15 +728,28 @@
   $('swapLang').addEventListener('click', () => { const t = S.me; S.me = S.them; S.them = t; saveSettings(); renderChrome(); renderAll(); if (listening) startListening(listening); });
   $('apiKey').addEventListener('input', (e) => { S.key = e.target.value.trim(); saveSettings(); $('openSettings').classList.toggle('attn', !S.key); if (S.key) setStatus(''); });
   $('autoSpeak').addEventListener('click', () => { S.autoSpeak = !S.autoSpeak; saveSettings(); renderChrome(); });
+  $('autoTurn').addEventListener('click', () => { S.autoTurn = !S.autoTurn; saveSettings(); renderChrome(); });
 
   function openSheet() { $('sheet').hidden = false; $('scrim').hidden = false; }
   function closeSheet() { $('sheet').hidden = true; $('scrim').hidden = true; }
   $('openSettings').addEventListener('click', openSheet);
   $('closeSettings').addEventListener('click', closeSheet);
   $('scrim').addEventListener('click', closeSheet);
-  $('clearChat').addEventListener('click', () => {
+  function clearConversation() {
+    stopListening(true);
+    try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch (e) { /* ignore */ }
+    speaking = false;
     for (const m of messages) if (m.ctl) m.ctl.abort();
-    messages.length = 0; renderAll(); setStatus(''); closeSheet();
+    messages.length = 0; renderAll(); setStatus(''); updateMicUI();
+  }
+  let resetArmed = null;
+  $('resetChat').addEventListener('click', () => {
+    if (resetArmed) { clearTimeout(resetArmed); resetArmed = null; $('resetChat').classList.remove('attn'); clearConversation(); setStatus('초기화됨'); return; }
+    $('resetChat').classList.add('attn'); setStatus('한 번 더 누르면 초기화', true);
+    resetArmed = setTimeout(() => { resetArmed = null; $('resetChat').classList.remove('attn'); setStatus(''); }, 3000);
+  });
+  $('clearChat').addEventListener('click', () => {
+    clearConversation(); closeSheet();
   });
 
   // Keep the screen awake while interpreting.
