@@ -82,6 +82,8 @@
   .msg .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 4px; }
   .msg .meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--p-muted); letter-spacing: .04em; }
   .msg .meta.err { color: var(--danger); }
+  .msg .meta.live { color: var(--live); }
+  .msg.is-live { border-style: dashed; }
   .msg .actions { display: flex; gap: 4px; }
   .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 8px; border: 1px solid var(--p-line); background: transparent; color: var(--p-muted); padding: 0; }
   .icon-btn:active { background: var(--p-line); }
@@ -170,7 +172,7 @@
   </section>
 
   <div class="bar" id="bar">
-    <span class="pair"><span id="pairMe">KO</span><span class="arrow">⇄</span><span id="pairThem">JA</span></span>
+    <span class="pair" title="v3"><span id="pairMe">KO</span><span class="arrow">⇄</span><span id="pairThem">JA</span><span class="arrow">v3</span></span>
     <select id="modelQuick" aria-label="번역 모델"></select>
     <span class="status" id="status"></span>
     <button type="button" class="bar-btn" id="openSettings" aria-label="설정">
@@ -355,14 +357,16 @@
     return '오류: ' + String(err.message || '').slice(0, 60);
   }
 
-  async function runTranslation(m) {
+  async function runTranslation(m, opts) {
+    opts = opts || {};
     if (m.ctl) m.ctl.abort();
     if (!S.key) {
       m.status = 'error'; m.err = '설정에서 API 키를 넣어주세요'; renderAll();
       $('openSettings').classList.add('attn'); return;
     }
     const ctl = new AbortController();
-    m.ctl = ctl; m.status = 'pending'; m.err = ''; m.dst = '';
+    m.ctl = ctl; m.status = 'pending'; m.err = '';
+    if (!opts.keepLive) m.dst = '';
     renderAll();
     const t0 = performance.now();
     try {
@@ -375,7 +379,9 @@
       m.ms = Math.round(performance.now() - t0);
       m.applied = modelOf(S.model).name;
       setStatus(`${m.applied} · ${(m.ms / 1000).toFixed(1)}s`);
-      if (m.dst && S.autoSpeak) speak(m.dst, m.dstLang);
+      if (m.finalizeOnDone) { m.finalizeOnDone = false; finishLive(m); }
+      else if (opts.onDone) opts.onDone();
+      else if (opts.speak !== false && m.dst && S.autoSpeak && !m.spoken) { m.spoken = true; speak(m.dst, m.dstLang); }
     } catch (e) {
       if (e && e.name === 'AbortError') return;
       m.status = 'error'; m.err = copyFor(e);
@@ -396,7 +402,7 @@
       status: 'pending', err: '', ctl: null,
     };
     messages.push(m);
-    runTranslation(m);
+    runTranslation(m, { speak: true });
   }
 
   // ---- speech recognition ----
@@ -410,6 +416,65 @@
   function inputOf(owner) { return owner === 'me' ? $('inputMe') : $('inputThem'); }
   function hintOf(owner) { return owner === 'me' ? $('hintMe') : $('hintThem'); }
 
+  // Live segment: the utterance being spoken right now. It shows up as a bubble at once,
+  // translation streams after a short pause, and the bubble is committed when the utterance ends.
+  let live = null;            // { owner, m, lastTranslated, timer }
+  const PARTIAL_DELAY = 700;  // ms of no new words before a partial translation is requested
+  const IS_WEBKIT = /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Safari/.test(navigator.userAgent) && !/Chrome|CriOS|Android/.test(navigator.userAgent));
+
+  function ensureLive(owner) {
+    if (live && live.owner === owner) return live;
+    commitLive();
+    const m = {
+      id: ++seq, by: owner, src: '', dst: '',
+      srcLang: owner === 'me' ? S.me : S.them,
+      dstLang: owner === 'me' ? S.them : S.me,
+      status: 'listening', err: '', ctl: null, live: true,
+    };
+    messages.push(m);
+    live = { owner, m, lastTranslated: '', timer: null };
+    return live;
+  }
+  function updateLive(owner, transcript, isFinal) {
+    transcript = (transcript || '').replace(/\s+/g, ' ').trim();
+    if (!transcript && !isFinal) return;
+    const L = ensureLive(owner);
+    const m = L.m;
+    if (transcript && transcript !== m.src) { m.src = transcript; renderAll(); }
+    clearTimeout(L.timer);
+    if (isFinal) { commitLive(); return; }
+    L.timer = setTimeout(() => translateLive(L, false), PARTIAL_DELAY);
+  }
+  function translateLive(L, final) {
+    const m = L.m;
+    if (!m.src) return;
+    if (m.src === L.lastTranslated && (m.status === 'done' || m.status === 'streaming' || m.status === 'pending')) {
+      if (final && m.status === 'done') finishLive(m);
+      return;
+    }
+    L.lastTranslated = m.src;
+    runTranslation(m, { speak: final, onDone: final ? () => finishLive(m) : null, keepLive: !final });
+  }
+  function finishLive(m) {
+    m.live = false;
+    if (m.status === 'done' && m.dst && S.autoSpeak && !m.spoken) { m.spoken = true; speak(m.dst, m.dstLang); }
+    renderAll();
+  }
+  function commitLive() {
+    if (!live) return;
+    const L = live; live = null;
+    clearTimeout(L.timer);
+    const m = L.m;
+    if (!m.src) { const i = messages.indexOf(m); if (i >= 0) messages.splice(i, 1); renderAll(); return; }
+    if (m.src === L.lastTranslated && m.status === 'done') { finishLive(m); return; }
+    if (m.src === L.lastTranslated && (m.status === 'streaming' || m.status === 'pending')) {
+      m.live = false; m.finalizeOnDone = true; renderAll(); return;
+    }
+    L.lastTranslated = m.src;
+    m.live = false;
+    runTranslation(m, { speak: true, onDone: () => finishLive(m) });
+  }
+
   function startListening(owner) {
     if (!SR) return;
     stopListening(true);
@@ -422,20 +487,39 @@
     const owner = listening;
     const r = new SR();
     r.lang = langOf(owner === 'me' ? S.me : S.them).tts;
-    r.continuous = true;
+    // One utterance per session, restarted automatically: more reliable than continuous mode on iOS.
+    r.continuous = !IS_WEBKIT;
     r.interimResults = true;
     r.maxAlternatives = 1;
-    const input = inputOf(owner);
+    let gotFinal = false;
+    let nResults = 0;
+    r.onstart = () => setStatus('듣는 중 (엔진 시작)');
+    r.onaudiostart = () => setStatus('듣는 중 (오디오 입력)');
+    r.onspeechstart = () => setStatus('말소리 감지');
     r.onresult = (e) => {
-      let interim = '';
-      for (let i = e.resultIndex; i < e.results.length; i++) {
+      nResults++; setStatus('인식 결과 ' + nResults);
+      let text = '';
+      let anyFinal = false;
+      // Some engines (iOS) resend the whole utterance in results[0]; others append segments.
+      for (let i = 0; i < e.results.length; i++) {
         const res = e.results[i];
-        const t = (res[0] && res[0].transcript || '').trim();
-        if (res.isFinal) { if (t) send(owner, t); }
-        else interim += t + ' ';
+        text += ((res[0] && res[0].transcript) || '') + ' ';
+        if (res.isFinal) anyFinal = true;
       }
-      input.value = interim.trim();
-      input.classList.toggle('interim', !!interim.trim());
+      if (r.continuous) {
+        // Continuous mode: only the newest non-final segment is live; final segments are committed.
+        let liveText = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const res = e.results[i];
+          const t = ((res[0] && res[0].transcript) || '').trim();
+          if (res.isFinal) { if (t) { updateLive(owner, t, false); updateLive(owner, t, true); } }
+          else liveText += t + ' ';
+        }
+        if (liveText.trim()) updateLive(owner, liveText, false);
+      } else {
+        gotFinal = anyFinal;
+        updateLive(owner, text, anyFinal);
+      }
     };
     r.onerror = (e) => {
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
@@ -444,28 +528,30 @@
       } else if (e.error === 'audio-capture') {
         listening = null; rec = null; updateMicUI();
         setStatus('마이크를 찾을 수 없어요', true);
+      } else {
+        setStatus('음성 인식 오류: ' + e.error, true);
       }
-      // 'no-speech', 'aborted', 'network': onend will restart while listening
     };
     r.onend = () => {
       if (rec !== r) return;
       rec = null;
-      input.value = ''; input.classList.remove('interim');
+      if (nResults === 0 && !/오류/.test($('status').textContent)) setStatus('엔진 종료 (결과 없음)', true);
+      if (!gotFinal) commitLive();  // the engine ended without marking final: commit what we have
       if (listening === owner && !speaking) {
         clearTimeout(restartTimer);
-        restartTimer = setTimeout(spinUp, 250);
+        restartTimer = setTimeout(spinUp, IS_WEBKIT ? 120 : 250);
       }
       updateMicUI();
     };
     rec = r;
-    try { r.start(); } catch (e) { rec = null; }
+    try { r.start(); } catch (e) { rec = null; setStatus('음성 인식을 시작할 수 없어요', true); }
     updateMicUI();
   }
   function stopListening(silent) {
     clearTimeout(restartTimer);
     listening = null;
     if (rec) { const r = rec; rec = null; try { r.onend = null; r.stop(); } catch (e) { /* ignore */ } }
-    for (const o of ['me', 'them']) { const i = inputOf(o); if (i.classList.contains('interim')) { i.value = ''; i.classList.remove('interim'); } }
+    commitLive();
     if (!silent) updateMicUI();
   }
   function updateMicUI() {
@@ -529,7 +615,7 @@
       const own = m.by === owner;
       const primary = own ? m.src : m.dst;
       const secondary = own ? m.dst : m.src;
-      const busy = m.status === 'pending' || m.status === 'streaming';
+      const busy = m.status === 'pending' || m.status === 'streaming' || m.status === 'listening';
       const waiting = !own && !m.dst && busy;
       const primaryHtml = waiting ? '<span class="dots"><i></i><i></i><i></i></span>' : esc(primary);
       let secondaryHtml = '';
@@ -537,13 +623,14 @@
       else secondaryHtml = esc(secondary);
       let meta = '<span class="meta"></span>';
       if (m.status === 'error') meta = `<span class="meta err">${esc(m.err)}</span>`;
+      else if (m.live) meta = `<span class="meta live">${own ? '● ' : ''}…</span>`;
       else if (m.status === 'done' && m.applied) meta = `<span class="meta">${esc(m.applied)} · ${(m.ms / 1000).toFixed(1)}s</span>`;
       const actions = [
         (primary && !waiting) ? `<button type="button" class="icon-btn" data-speak="${m.id}" data-owner="${owner}" aria-label="Speak">${ICON_SPEAK}</button>` : '',
-        busy ? `<button type="button" class="icon-btn" data-stop="${m.id}" aria-label="Stop">${ICON_STOP}</button>` : '',
+        (busy && !m.live) ? `<button type="button" class="icon-btn" data-stop="${m.id}" aria-label="Stop">${ICON_STOP}</button>` : '',
         m.status === 'error' ? `<button type="button" class="icon-btn" data-retry="${m.id}" aria-label="Retry">${ICON_RETRY}</button>` : '',
       ].join('');
-      return `<div class="msg ${own ? 'own' : 'other'}" data-id="${m.id}">
+      return `<div class="msg ${own ? 'own' : 'other'}${m.live ? ' is-live' : ''}" data-id="${m.id}">
         <div class="primary" lang="${esc(own ? m.srcLang : m.dstLang)}">${primaryHtml}</div>
         ${secondaryHtml ? `<div class="secondary" lang="${esc(own ? m.dstLang : m.srcLang)}">${secondaryHtml}</div>` : ''}
         <div class="row">${meta}<span class="actions">${actions}</span></div>
@@ -616,8 +703,8 @@
 
   $('modelQuick').addEventListener('change', (e) => { S.model = e.target.value; saveSettings(); renderChrome(); });
   $('models').addEventListener('click', (e) => { const b = e.target.closest('.model'); if (!b) return; S.model = b.dataset.model; saveSettings(); renderChrome(); });
-  $('selMe').addEventListener('change', (e) => { S.me = e.target.value; saveSettings(); renderChrome(); renderAll(); if (listening === 'me') startListening('me'); });
-  $('selThem').addEventListener('change', (e) => { S.them = e.target.value; saveSettings(); renderChrome(); renderAll(); if (listening === 'them') startListening('them'); });
+  $('selMe').addEventListener('change', (e) => { S.me = e.target.value; saveSettings(); renderChrome(); renderAll(); if (listening === 'me') startListening('me'); else commitLive(); });
+  $('selThem').addEventListener('change', (e) => { S.them = e.target.value; saveSettings(); renderChrome(); renderAll(); if (listening === 'them') startListening('them'); else commitLive(); });
   $('swapLang').addEventListener('click', () => { const t = S.me; S.me = S.them; S.them = t; saveSettings(); renderChrome(); renderAll(); if (listening) startListening(listening); });
   $('apiKey').addEventListener('input', (e) => { S.key = e.target.value.trim(); saveSettings(); $('openSettings').classList.toggle('attn', !S.key); if (S.key) setStatus(''); });
   $('autoSpeak').addEventListener('click', () => { S.autoSpeak = !S.autoSpeak; saveSettings(); renderChrome(); });
